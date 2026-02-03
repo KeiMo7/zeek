@@ -1,0 +1,92 @@
+# See the file "COPYING" in the main distribution directory for copyright.
+
+module NAT;
+
+import spicy;
+import NATPMP;
+import PCP;
+
+type PortData = struct {
+    int_port: port;
+    ext_port: port;
+    lifetime: interval;
+};
+
+type PCPEventData = struct {
+    ports: PortData;
+    internal_ip: optional<addr>;
+    nonce_high: uint64;
+    nonce_low: uint32;
+};
+
+public type Packet = unit {
+    %port = 5351/udp;
+
+    version: uint8;
+    switch (self.version) {
+        0 -> natpmp: NATPMP::Record();
+        2 -> pcp: PCP::Record();
+    };
+};
+
+public type ResultCode = enum {
+    SUCCESS = 0,
+    PROTOCOL_FAILURE = 1,
+    POLICY_FAILURE = 2,
+    TIMEOUT = 3,
+};
+
+public function make_event_data(r: NATPMP::MapRequest): PortData {
+    # TODO: do we need to send the epoch time with this or should we just assume it's
+    return [$int_port = port(r.internal_port, r.proto), $ext_port = port(r.external_port, r.proto), $lifetime = interval(r.lifetime)];
+}
+
+public function make_event_data(r: NATPMP::MapResponse): PortData {
+    return [$int_port = port(r.internal_port, r.proto), $ext_port = port(r.external_port, r.proto), $lifetime = interval(r.lifetime)];
+}
+
+public function make_event_data(r: PCP::Request): PCPEventData {
+    local ports: PortData = [$int_port = port(r.op.internal_port, r.op.proto), $ext_port = port(r.op.external_port, r.op.proto), $lifetime = interval(r.lifetime)];
+
+    return [$ports = ports, $internal_ip = r.ip, $nonce_high = r.op.nonce_high, $nonce_low = r.op.nonce_low];
+}
+
+public function make_event_data(r: PCP::Response): PCPEventData {
+    local ports: PortData = [$int_port = port(r.op.internal_port, r.op.proto), $ext_port = port(r.op.external_port, r.op.proto), $lifetime = interval(r.lifetime)];
+
+    return [$ports = ports, $internal_ip = Null, $nonce_high = r.op.nonce_high, $nonce_low = r.op.nonce_low];
+}
+
+public function convert_result_code(resp: NATPMP::MapResponse): ResultCode {
+    switch (resp.result_code) {
+        case NATPMP::ResultCode::SUCCESS: return ResultCode::SUCCESS;
+        case NATPMP::ResultCode::UNSUPPORTED_VERSION: return ResultCode::PROTOCOL_FAILURE;
+        case NATPMP::ResultCode::NOT_AUTHORIZED: return ResultCode::POLICY_FAILURE;
+        case NATPMP::ResultCode::NETWORK_FAILURE: return ResultCode::POLICY_FAILURE;
+        case NATPMP::ResultCode::OUT_OF_RESOURCES: return ResultCode::POLICY_FAILURE;
+        case NATPMP::ResultCode::UNSUPPORTED_OPCODE: return ResultCode::PROTOCOL_FAILURE;
+    }
+
+    return ResultCode::SUCCESS;
+}
+
+public function convert_result_code(resp: PCP::Response): ResultCode {
+    switch (resp.result_code) {
+        case PCP::ResultCode::SUCCESS: return ResultCode::SUCCESS;
+        case PCP::ResultCode::UNSUPP_VERSION: return ResultCode::PROTOCOL_FAILURE;
+        case PCP::ResultCode::NOT_AUTHORIZED: return ResultCode::POLICY_FAILURE;
+        case PCP::ResultCode::MALFORMED_REQUEST: return ResultCode::PROTOCOL_FAILURE;
+        case PCP::ResultCode::UNSUPP_OPCODE: return ResultCode::PROTOCOL_FAILURE;
+        case PCP::ResultCode::UNSUPP_OPTION: return ResultCode::PROTOCOL_FAILURE;
+        case PCP::ResultCode::MALFORMED_OPTION: return ResultCode::PROTOCOL_FAILURE;
+        case PCP::ResultCode::NETWORK_FAILURE: return ResultCode::POLICY_FAILURE;
+        case PCP::ResultCode::NO_RESOURCES: return ResultCode::POLICY_FAILURE;
+        case PCP::ResultCode::UNSUPP_PROTOCOL: return ResultCode::PROTOCOL_FAILURE;
+        case PCP::ResultCode::USER_EX_QUOTA: return ResultCode::POLICY_FAILURE;
+        case PCP::ResultCode::CANNOT_PROVIDE_EXTERNAL: return ResultCode::POLICY_FAILURE;
+        case PCP::ResultCode::ADDRESS_MISMATCH: return ResultCode::POLICY_FAILURE;
+        case PCP::ResultCode::EXCESSIVE_REMOTE_PEERS: return ResultCode::POLICY_FAILURE;
+    }
+
+    return ResultCode::SUCCESS;
+}

@@ -1,0 +1,22 @@
+# See the file "COPYING" in the main distribution directory for copyright.
+
+%doc-id= Zeek::NAT;
+%doc-description= "Analyzer for NATPMP and PCP port mapping protocols";
+
+protocol analyzer NAT over UDP:
+         parse originator with NAT::Packet,
+         parse responder with NAT::Packet;
+
+import NAT;
+import NATPMP;
+import PCP;
+
+on NATPMP::MapRequest -> event NAT::map_request(
+    $conn, NAT::make_event_data(self));
+on NATPMP::MapResponse -> event NAT::map_response(
+    $conn, NAT::make_event_data(self),  NAT::convert_result_code(self));
+
+on PCP::Request if (self.opcode_ == PCP::Opcode::MAP || self.opcode_ == PCP::Opcode::PEER) -> event NAT::map_request(
+    $conn, NAT::make_event_data(self));
+on PCP::Response if (self.opcode_ == PCP::Opcode::MAP || self.opcode_ == PCP::Opcode::PEER) -> event NAT::map_response(
+    $conn, NAT::make_event_data(self), NAT::convert_result_code(self));
