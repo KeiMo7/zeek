@@ -435,6 +435,22 @@ add_custom_target(zeek_autogen_files)
 add_library(zeek_lib STATIC EXCLUDE_FROM_ALL )
 zeek_target_enable_sanitizers(zeek_lib)
 target_link_libraries(zeek_lib PUBLIC $<BUILD_INTERFACE:zeek_internal>)
+
+# Helper to link `zeek_lib`. Since it is a STATIC archive, but contains e.g., global constructors we need to link everything.
+function (zeek_link_lib target)
+    if (CMAKE_VERSION VERSION_GREATER_EQUAL 3.24)
+        # TODO: Remove platform-specific fallbacks once we require cmake-3.24.
+        target_link_libraries(${target} PRIVATE $<LINK_LIBRARY:WHOLE_ARCHIVE,zeek_lib>)
+    elseif (APPLE)
+        target_link_libraries(${target} PRIVATE "-Wl,-force_load,$<TARGET_FILE:zeek_lib>" zeek_lib)
+    elseif (MSVC)
+        target_link_libraries(${target} PRIVATE "/WHOLEARCHIVE:$<TARGET_FILE:zeek_lib>" zeek_lib)
+    elseif (UNIX)
+        target_link_libraries(${target} PRIVATE "-Wl,--whole-archive" zeek_lib
+                                                "-Wl,--no-whole-archive")
+    endif ()
+endfunction ()
+
 add_dependencies(zeek_lib zeek_autogen_files)
 set_target_properties(zeek_lib PROPERTIES RUNTIME_OUTPUT_NAME libzeek)
 if (NOT CMAKE_LIBRARY_OUTPUT_DIRECTORY)
