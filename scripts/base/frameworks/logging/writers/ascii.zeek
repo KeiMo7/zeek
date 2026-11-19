@@ -26,6 +26,35 @@ export {
 	## This option is also available as a per-filter ``$config`` option.
 	const use_json = F &redef;
 
+	## If true, enable strict type handling for ASCII log output. This
+	## stabilizes the field types that log consumers observe:
+	##
+	## * The declared column type (as shown in the ``#types`` header)
+	##   always wins over the type of an individual value. Values that
+	##   can be represented losslessly in the declared type are coerced
+	##   to it; for example, an integral value observed for a ``double``
+	##   column is written as a ``double``.
+	## * Type conflicts that cannot be reconciled losslessly (for
+	##   example a negative ``int`` value for a ``count`` column) are
+	##   reported via a warning, once per field, and the value is
+	##   written using the widest of the two types so that no
+	##   information is silently truncated.
+	## * When a log file from a previous run already exists at the
+	##   output path, its ``#fields`` and ``#types`` headers are
+	##   compared against the current ones and a warning is generated
+	##   if they differ. This detects the same field being logged with
+	##   different types across runs instead of silently writing files
+	##   with different formats.
+	## * String values containing bytes that are not valid UTF-8 are
+	##   reported once per field. The raw bytes are preserved in the
+	##   output as ``\xNN`` escapes; the record is not dropped.
+	## * In JSON mode, unset optional fields are always included with a
+	##   ``null`` value so that missing fields have a uniform, typed
+	##   placeholder.
+	##
+	## This option is also available as a per-filter ``$config`` option.
+	const strict_types = F &redef;
+
 	## If true, detect log files that did not get properly rotated
 	## by a previous Zeek process (e.g. due to crash) and rotate them.
 	##

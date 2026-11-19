@@ -5,6 +5,7 @@
 #pragma once
 
 #include <zlib.h>
+#include <set>
 #include <string>
 
 #include "zeek/Desc.h"
@@ -47,6 +48,9 @@ private:
     void InitConfigOptions();
     bool InitFilterOptions();
     bool InitFormatter();
+    void ReconcileFieldTypes(int num_fields, const threading::Field* const* fields, threading::Value** vals);
+    void StrictWarnOnce(const std::string& key, const std::string& msg);
+    void CheckPreviousHeader();
     bool InternalWrite(int fd, const char* data, int len);
     bool InternalClose(int fd);
 
@@ -70,11 +74,16 @@ private:
     int gzip_level; // level > 0 enables gzip compression
     std::string gzip_file_extension;
     bool use_json;
+    bool strict_types;
     bool enable_utf_8;
     std::string json_timestamps;
     bool json_include_unset_fields;
     std::string json_string_escape_policy;
     std::string logdir;
+
+    // Keys of strict-types warnings already emitted, to report each
+    // distinct problem only once per writer.
+    std::set<std::string> strict_warnings;
 
     threading::Formatter* formatter;
     bool init_options;

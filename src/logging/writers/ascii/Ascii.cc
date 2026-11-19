@@ -13,10 +13,13 @@
 #ifdef _MSC_VER
 #include <io.h>
 #endif
+#include <algorithm>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "zeek/Func.h"
@@ -121,6 +124,189 @@ TEST_CASE("writers.ascii prefix_basename_with") {
 #endif
 }
 
+/**
+ * Outcome of reconciling the type of a single log value with the type
+ * declared for its column. Used by the strict-types mode.
+ */
+enum class TypeReconciliation {
+    UNCHANGED,    // Types already matched, nothing to do.
+    COERCED,      // Value was losslessly coerced to the declared type.
+    KEPT_OBSERVED // Conflict cannot be reconciled; value keeps its observed type.
+};
+
+/**
+ * Reconciles the type of a log value with the column type declared for it.
+ *
+ * The declared type always wins when the observed value can be represented
+ * in it losslessly (e.g. an integral value observed for a double column).
+ * If no lossless reconciliation exists, the value keeps its observed type,
+ * which is the widest of the two, so that no information is silently
+ * truncated. The caller is expected to report anything but UNCHANGED.
+ */
+static TypeReconciliation reconcile_value_type(const Field& field, Value* val) {
+    if ( ! val->present || val->type == field.type )
+        return TypeReconciliation::UNCHANGED;
+
+    switch ( field.type ) {
+        case TYPE_DOUBLE:
+        case TYPE_TIME:
+        case TYPE_INTERVAL:
+            if ( val->type == TYPE_INT ) {
+                val->val.double_val = static_cast<double>(val->val.int_val);
+                val->type = field.type;
+                return TypeReconciliation::COERCED;
+            }
+            if ( val->type == TYPE_COUNT ) {
+                val->val.double_val = static_cast<double>(val->val.uint_val);
+                val->type = field.type;
+                return TypeReconciliation::COERCED;
+            }
+            break;
+
+        case TYPE_COUNT:
+            if ( val->type == TYPE_INT && val->val.int_val >= 0 ) {
+                val->val.uint_val = static_cast<zeek_uint_t>(val->val.int_val);
+                val->type = TYPE_COUNT;
+                return TypeReconciliation::COERCED;
+            }
+            break;
+
+        case TYPE_INT:
+            if ( val->type == TYPE_COUNT && val->val.uint_val <= static_cast<zeek_uint_t>(INT64_MAX) ) {
+                val->val.int_val = static_cast<zeek_int_t>(val->val.uint_val);
+                val->type = TYPE_INT;
+                return TypeReconciliation::COERCED;
+            }
+            break;
+
+        case TYPE_STRING: {
+            // Render scalar numbers into their canonical string form.
+            std::string s;
+
+            switch ( val->type ) {
+                case TYPE_INT: s = std::to_string(val->val.int_val); break;
+                case TYPE_COUNT: s = std::to_string(val->val.uint_val); break;
+                case TYPE_DOUBLE:
+                case TYPE_TIME:
+                case TYPE_INTERVAL: s = threading::Formatter::Render(val->val.double_val); break;
+                default: break;
+            }
+
+            if ( ! s.empty() ) {
+                char* buf = new char[s.size()];
+                memcpy(buf, s.data(), s.size());
+                val->val.string_val.data = buf;
+                val->val.string_val.length = static_cast<int>(s.size());
+                val->type = TYPE_STRING;
+                return TypeReconciliation::COERCED;
+            }
+
+            break;
+        }
+
+        default: break;
+    }
+
+    return TypeReconciliation::KEPT_OBSERVED;
+}
+
+TEST_CASE("writers.ascii reconcile_value_type") {
+    // Integral value observed for a double column: declared type wins.
+    {
+        Field field{"d", nullptr, TYPE_DOUBLE, TYPE_ERROR, false};
+        Value val{TYPE_INT, true};
+        val.val.int_val = 3;
+        CHECK(reconcile_value_type(field, &val) == TypeReconciliation::COERCED);
+        CHECK(val.type == TYPE_DOUBLE);
+        CHECK(val.val.double_val == 3.0);
+    }
+
+    // Non-negative int observed for a count column: coerced to count.
+    {
+        Field field{"c", nullptr, TYPE_COUNT, TYPE_ERROR, false};
+        Value val{TYPE_INT, true};
+        val.val.int_val = 42;
+        CHECK(reconcile_value_type(field, &val) == TypeReconciliation::COERCED);
+        CHECK(val.type == TYPE_COUNT);
+        CHECK(val.val.uint_val == 42);
+    }
+
+    // Negative int observed for a count column: not representable, the
+    // value keeps its observed type rather than being truncated.
+    {
+        Field field{"c", nullptr, TYPE_COUNT, TYPE_ERROR, false};
+        Value val{TYPE_INT, true};
+        val.val.int_val = -1;
+        CHECK(reconcile_value_type(field, &val) == TypeReconciliation::KEPT_OBSERVED);
+        CHECK(val.type == TYPE_INT);
+        CHECK(val.val.int_val == -1);
+    }
+
+    // Count that fits observed for an int column: coerced to int.
+    {
+        Field field{"i", nullptr, TYPE_INT, TYPE_ERROR, false};
+        Value val{TYPE_COUNT, true};
+        val.val.uint_val = 7;
+        CHECK(reconcile_value_type(field, &val) == TypeReconciliation::COERCED);
+        CHECK(val.type == TYPE_INT);
+        CHECK(val.val.int_val == 7);
+    }
+
+    // Count too large for int64 observed for an int column: kept as count.
+    {
+        Field field{"i", nullptr, TYPE_INT, TYPE_ERROR, false};
+        Value val{TYPE_COUNT, true};
+        val.val.uint_val = static_cast<zeek_uint_t>(INT64_MAX) + 1;
+        CHECK(reconcile_value_type(field, &val) == TypeReconciliation::KEPT_OBSERVED);
+        CHECK(val.type == TYPE_COUNT);
+        CHECK(val.val.uint_val == static_cast<zeek_uint_t>(INT64_MAX) + 1);
+    }
+
+    // Number observed for a string column: rendered into string form.
+    {
+        Field field{"s", nullptr, TYPE_STRING, TYPE_ERROR, false};
+        Value val{TYPE_COUNT, true};
+        val.val.uint_val = 1234;
+        CHECK(reconcile_value_type(field, &val) == TypeReconciliation::COERCED);
+        CHECK(val.type == TYPE_STRING);
+        CHECK(std::string_view(val.val.string_val.data, val.val.string_val.length) == "1234");
+    }
+
+    // Matching types: nothing to do.
+    {
+        Field field{"c", nullptr, TYPE_COUNT, TYPE_ERROR, false};
+        Value val{TYPE_COUNT, true};
+        val.val.uint_val = 5;
+        CHECK(reconcile_value_type(field, &val) == TypeReconciliation::UNCHANGED);
+    }
+}
+
+/**
+ * Returns true if the given string contains bytes that are not valid
+ * UTF-8 (or are disallowed code points such as non-ASCII control
+ * characters). Such bytes are preserved in log output as \xNN escapes.
+ */
+static bool has_non_utf8_bytes(std::string_view sv) {
+    // Bytes below 0x80 always pass through escape_utf8() unchanged,
+    // including ASCII control characters.
+    if ( std::none_of(sv.begin(), sv.end(), [](char c) { return static_cast<unsigned char>(c) >= 0x80; }) )
+        return false;
+
+    // With ESCAPE_NONE, escape_utf8() passes everything through except
+    // byte sequences it considers invalid, which it hex-escapes. Any
+    // difference between input and output hence flags such bytes.
+    return util::escape_utf8(sv, util::ESCAPE_NONE) != sv;
+}
+
+TEST_CASE("writers.ascii has_non_utf8_bytes") {
+    CHECK(! has_non_utf8_bytes("plain ascii"));
+    CHECK(! has_non_utf8_bytes("tab\tand\nnewline"));
+    CHECK(! has_non_utf8_bytes("\xc3\xb1"));     // valid UTF-8
+    CHECK(has_non_utf8_bytes("\xc3\x28"));       // invalid sequence
+    CHECK(has_non_utf8_bytes("lone \x82 byte")); // lone continuation byte
+    CHECK(has_non_utf8_bytes("\xed\xa0\xa1"));   // UTF-16 surrogate
+}
+
 static std::optional<LeftoverLog> parse_shadow_log(const std::string& fname) {
     auto sfname = prefix_basename_with(fname, shadow_file_prefix);
     string default_ext = "." + Ascii::LogExt();
@@ -215,6 +401,7 @@ Ascii::Ascii(WriterFrontend* frontend) : WriterBackend(frontend, /*send_heartbea
     include_meta = false;
     tsv = false;
     use_json = false;
+    strict_types = false;
     enable_utf_8 = false;
     json_include_unset_fields = false;
     formatter = nullptr;
@@ -229,6 +416,7 @@ void Ascii::InitConfigOptions() {
     output_to_stdout = BifConst::LogAscii::output_to_stdout;
     include_meta = BifConst::LogAscii::include_meta;
     use_json = BifConst::LogAscii::use_json;
+    strict_types = BifConst::LogAscii::strict_types;
     enable_utf_8 = BifConst::LogAscii::enable_utf_8;
     gzip_level = BifConst::LogAscii::gzip_level;
 
@@ -288,6 +476,17 @@ bool Ascii::InitFilterOptions() {
                 use_json = false;
             else {
                 Error("invalid value for 'use_json', must be a string and either \"T\" or \"F\"");
+                return false;
+            }
+        }
+
+        else if ( strcmp(key, "strict_types") == 0 ) {
+            if ( strcmp(value, "T") == 0 )
+                strict_types = true;
+            else if ( strcmp(value, "F") == 0 )
+                strict_types = false;
+            else {
+                Error("invalid value for 'strict_types', must be a string and either \"T\" or \"F\"");
                 return false;
             }
         }
@@ -353,6 +552,11 @@ bool Ascii::InitFilterOptions() {
         else if ( strcmp(key, "gzip_file_extension") == 0 )
             gzip_file_extension.assign(value);
     }
+
+    if ( strict_types && use_json )
+        // Give missing fields a uniform, typed placeholder in JSON
+        // output rather than silently omitting the key.
+        json_include_unset_fields = true;
 
     if ( ! InitFormatter() )
         return false;
@@ -501,6 +705,12 @@ bool Ascii::DoInit(const WriterInfo& info, int num_fields, const threading::Fiel
         }
     }
 
+    if ( strict_types && ! IsSpecial(fname) )
+        // About to truncate any pre-existing file at this path. Compare
+        // its header against the current columns first so that type
+        // changes across runs do not go unnoticed.
+        CheckPreviousHeader();
+
     int open_flags = O_WRONLY | O_CREAT | O_TRUNC;
 #ifdef _MSC_VER
     // Gzip output is binary data; without O_BINARY Windows translates \n to \r\n, corrupting the stream.
@@ -619,6 +829,9 @@ bool Ascii::DoWrite(int num_fields, const threading::Field* const* fields, threa
     if ( ! fd )
         DoInit(Info(), NumFields(), Fields());
 
+    if ( strict_types )
+        ReconcileFieldTypes(num_fields, fields, vals);
+
     desc.Clear();
 
     if ( ! formatter->Describe(&desc, num_fields, fields, vals) )
@@ -652,6 +865,126 @@ bool Ascii::DoWrite(int num_fields, const threading::Field* const* fields, threa
 write_error:
     Error(Fmt("error writing to %s: %s", fname.c_str(), Strerror(errno)));
     return false;
+}
+
+void Ascii::StrictWarnOnce(const std::string& key, const std::string& msg) {
+    if ( ! strict_warnings.insert(key).second )
+        return;
+
+    Warning(msg.c_str());
+}
+
+void Ascii::ReconcileFieldTypes(int num_fields, const threading::Field* const* fields, threading::Value** vals) {
+    for ( int i = 0; i < num_fields; i++ ) {
+        const threading::Field* field = fields[i];
+        threading::Value* val = vals[i];
+
+        if ( ! val->present )
+            continue;
+
+        if ( val->type != field->type ) {
+            TypeTag observed = val->type;
+            auto key = util::fmt("type:%s:%d:%d", field->name, field->type, observed);
+
+            if ( reconcile_value_type(*field, val) == TypeReconciliation::COERCED )
+                StrictWarnOnce(key, util::fmt("log field '%s' (path '%s'): value of type %s does not match "
+                                              "declared type %s; coerced value to the declared type",
+                                              field->name, Info().path, type_name(observed),
+                                              type_name(field->type)));
+            else
+                StrictWarnOnce(key, util::fmt("log field '%s' (path '%s'): value of type %s cannot be "
+                                              "reconciled with declared type %s; writing value with its "
+                                              "observed type",
+                                              field->name, Info().path, type_name(observed),
+                                              type_name(field->type)));
+        }
+
+        if ( (val->type == TYPE_TABLE || val->type == TYPE_VECTOR) && val->subtype != TYPE_VOID &&
+             val->subtype != TYPE_ERROR && field->subtype != TYPE_ERROR && val->subtype != field->subtype )
+            StrictWarnOnce(util::fmt("subtype:%s:%d:%d", field->name, field->subtype, val->subtype),
+                           util::fmt("log field '%s' (path '%s'): element type %s does not match declared "
+                                     "element type %s; writing value with its observed element type",
+                                     field->name, Info().path, type_name(val->subtype),
+                                     type_name(field->subtype)));
+
+        if ( val->type == TYPE_STRING || val->type == TYPE_ENUM || val->type == TYPE_FILE ||
+             val->type == TYPE_FUNC ) {
+            std::string_view sv(val->val.string_val.data, static_cast<size_t>(val->val.string_val.length));
+
+            if ( has_non_utf8_bytes(sv) )
+                StrictWarnOnce(util::fmt("utf8:%s", field->name),
+                               util::fmt("log field '%s' (path '%s') contains bytes that are not valid "
+                                         "UTF-8; preserving raw bytes as \\xNN escapes",
+                                         field->name, Info().path));
+        }
+    }
+}
+
+void Ascii::CheckPreviousHeader() {
+    if ( ! util::is_file(fname) )
+        return;
+
+    std::ifstream in(fname, std::ios::binary);
+
+    if ( ! in )
+        return;
+
+    // Skip gzip-compressed leftovers; their header isn't readable here.
+    char magic[2] = {0, 0};
+    in.read(magic, 2);
+
+    if ( in.gcount() == 2 && static_cast<unsigned char>(magic[0]) == 0x1f &&
+         static_cast<unsigned char>(magic[1]) == 0x8b )
+        return;
+
+    in.clear();
+    in.seekg(0);
+
+    const std::string fields_key = meta_prefix + "fields" + separator;
+    const std::string types_key = meta_prefix + "types" + separator;
+
+    std::string prev_fields;
+    std::string prev_types;
+    std::string line;
+
+    // The meta header sits at the top of the file; stop at the first
+    // non-meta line.
+    for ( int i = 0; i < 64 && std::getline(in, line); i++ ) {
+        if ( line.starts_with(fields_key) )
+            prev_fields = line.substr(fields_key.size());
+        else if ( line.starts_with(types_key) )
+            prev_types = line.substr(types_key.size());
+        else if ( ! line.starts_with(meta_prefix) )
+            break;
+    }
+
+    if ( prev_fields.empty() && prev_types.empty() )
+        // Not a Zeek ASCII log with meta headers (e.g. TSV or JSON
+        // output, or an unrelated file): nothing to compare against.
+        return;
+
+    std::string names;
+    std::string types;
+
+    for ( int i = 0; i < NumFields(); ++i ) {
+        if ( i > 0 ) {
+            names += separator;
+            types += separator;
+        }
+
+        names += Fields()[i]->name;
+        types += Fields()[i]->TypeName();
+    }
+
+    if ( prev_fields != names )
+        Warning(Fmt("log file '%s' exists from a previous run with different columns (previous: %s, "
+                    "current: %s); overwriting it",
+                    fname.c_str(), prev_fields.c_str(), names.c_str()));
+
+    if ( prev_types != types )
+        Warning(Fmt("log file '%s' exists from a previous run with different column types (previous: %s, "
+                    "current: %s); overwriting it",
+                    fname.c_str(), prev_types.c_str(), types.c_str()));
 }
 
 bool Ascii::DoRotate(const char* rotated_path, double open, double close, bool terminating) {
